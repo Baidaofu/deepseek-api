@@ -1,0 +1,8 @@
+build/
+.gradle/
+local.properties
+*.apk
+*.idsig
+*.class
+# the pinned signing key lives in ci/signing/ and is copied in by the build
+module/debug.keystore

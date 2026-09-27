@@ -1,0 +1,131 @@
+name: build
+
+on:
+  push:
+    branches: [main]
+  workflow_dispatch:
+
+permissions:
+  contents: read
+
+jobs:
+  # Fast, hermetic check of the gateway itself. No Android SDK required.
+  gateway-tests:
+    name: gateway tests (JVM)
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+
+      - name: Fetch org.json
+        run: |
+          mkdir -p build/deps
+          curl -fsSL --retry 3 \
+            https://repo1.maven.org/maven2/org/json/json/20240303/json-20240303.jar \
+            -o build/deps/json.jar
+
+      - name: Run gateway test suite
+        env:
+          JSON_JAR: ${{ github.workspace }}/build/deps/json.jar
+        run: bash run-tests.sh
+
+  # Full module APK via the Gradle/Compose project that produced the upstream release.
+  build-apk:
+    name: build module APK
+    runs-on: ubuntu-latest
+    needs: gateway-tests
+    timeout-minutes: 120
+    steps:
+      - uses: actions/checkout@v4
+
+      # AGP 9.3.0's lint needs JDK 21 (the upstream docs say 17, which fails).
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '21'
+
+      - uses: android-actions/setup-android@v3
+
+      - name: Install Android platform 37 and build tools
+        run: |
+          yes | sdkmanager --licenses >/dev/null 2>&1 || true
+          sdkmanager "platforms;android-37.0" "build-tools;37.0.0"
+          # AGP resolves compileSdk 37 as platforms/android-37
+          if [ ! -d "$ANDROID_SDK_ROOT/platforms/android-37" ]; then
+            ln -s "$ANDROID_SDK_ROOT/platforms/android-37.0" \
+                  "$ANDROID_SDK_ROOT/platforms/android-37"
+          fi
+
+      - name: Install Gradle 9.7.1
+        run: |
+          curl -sSL -o /tmp/gradle.zip \
+            https://services.gradle.org/distributions/gradle-9.7.1-bin.zip
+          unzip -q /tmp/gradle.zip -d "$HOME/gradle-dist"
+          echo "$HOME/gradle-dist/gradle-9.7.1/bin" >> "$GITHUB_PATH"
+
+      - name: Apply Local API patches
+        run: python3 ci/apply-local-api.py . .
+
+      - name: Prepare the Gradle build
+        run: |
+          cd compose-launcher
+          # 1. gradle.properties hardcodes a Termux aapt2 path.
+          sed -i '/aapt2FromMavenOverride/d' gradle.properties
+          # 2. build.gradle.kts references a Closed-only source dir that is absent here.
+          mkdir -p ../editions/closed/full-backup-src
+          # 3. module/debug.keystore is gitignored; install the pinned one so every
+          #    build shares an identity and updates install in place.
+          cp ../ci/signing/deepseek-api.jks ../module/debug.keystore
+
+      - name: Build Open API APK
+        run: |
+          cd compose-launcher
+          gradle :app:assembleRelease -PprotectedBuild=false --no-daemon
+
+      - name: Verify APK
+        run: |
+          APK=$(find compose-launcher/app/build/outputs/apk/release -name '*.apk' | head -n1)
+          echo "verifying $APK"
+          ls -l "$APK"
+          "$ANDROID_SDK_ROOT"/build-tools/37.0.0/apksigner verify --print-certs "$APK"
+          "$ANDROID_SDK_ROOT"/build-tools/37.0.0/aapt2 dump badging "$APK" | head -n 4
+
+          mkdir -p build/verify
+          unzip -o -q "$APK" classes.dex -d build/verify
+
+          # 1. gateway + engine must both be present
+          for cls in 'Lcom/dsmod/probe/z1;' 'Lcom/dsmod/probe/LocalApiEngine;'; do
+            grep -a -q "$cls" build/verify/classes.dex \
+              || { echo "FAIL: $cls missing from DEX"; exit 1; }
+          done
+          echo "gateway + engine classes present"
+
+          # 2. Local API components declared
+          "$ANDROID_SDK_ROOT"/build-tools/37.0.0/aapt2 dump xmltree --file AndroidManifest.xml "$APK" \
+            | grep -q 'com.dsmod.probe.z21' \
+            || { echo "FAIL: keep-alive service not declared"; exit 1; }
+          echo "keep-alive service declared"
+
+          # 3. no author promotional content
+          status=0
+          for needle in afdian t.me/Deekseepapp 1106465300 qun.qq.com \
+                        releases/latest license.lllucccian 'Sponsor via Afdian' \
+                        'Community group' '@lllucccian'; do
+            if grep -a -q -- "$needle" build/verify/classes.dex; then
+              echo "FAIL: promotional content present: $needle"; status=1
+            else
+              echo "ok: absent -> $needle"
+            fi
+          done
+          exit $status
+
+      - name: Upload APK
+        uses: actions/upload-artifact@v4
+        with:
+          name: deepseek-api-apk
+          path: compose-launcher/app/build/outputs/apk/release/*.apk
+          if-no-files-found: error

@@ -1,0 +1,6 @@
+*.sh text eol=lf
+*.py text eol=lf
+*.yml text eol=lf
+*.java text eol=lf
+*.kt text eol=lf
+*.jks binary
