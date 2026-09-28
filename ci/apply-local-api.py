@@ -784,6 +784,29 @@ def patch_gradle_inputs(upstream):
     )
 
 
+def fix_open_launcher_crash(upstream):
+    """Fix an upstream bug that crashes the launcher in every Open build.
+
+    `HomePage` only initialises `device` for the Closed distribution:
+
+        val device = if (BuildInfo.PROTECTED_BUILD) remember { deviceSnapshot() } else null
+
+    but the "device information" panel below dereferences it unconditionally
+    (`device!!.product`).  Open builds therefore throw a NullPointerException on the
+    first frame and the module's own page never opens.  `deviceSnapshot()` reads only
+    public Build/Os fields, so it is safe in the Open build too.
+    """
+    kt = os.path.join(upstream, "compose-launcher", "app", "src", "main", "java",
+                      "com", "dsmod", "probe", "SettingsActivity.kt")
+    replace_once(
+        kt,
+        "        val device = if (BuildInfo.PROTECTED_BUILD) remember { deviceSnapshot() }"
+        " else null\n",
+        "        val device = remember { deviceSnapshot() }\n",
+        "launcher device NPE",
+    )
+
+
 def main(argv):
     if len(argv) != 3:
         raise SystemExit(__doc__)
@@ -796,8 +819,8 @@ def main(argv):
     overlay_sources(upstream, api_root)
     print("stripping promotional content")
     strip_promotional_content(upstream, api_root)
-    print("reducing UI to the Local API screen")
-    make_ui_api_only(upstream)
+    print("fixing the Open-build launcher crash")
+    fix_open_launcher_crash(upstream)
     print("restoring manifest components")
     patch_manifest(upstream)
     print("installing execution engine")
